@@ -123,6 +123,59 @@ export async function startShowWithPopup(
   return viewer;
 }
 
+/**
+ * 双屏确认模式：开始放映并接住“主投影 / 备用投影”两个弹窗（同一次点击手势内
+ * 连续 window.open，按事件到达顺序依据 ?role 归位）。默认等待两侧 HUD 出现。
+ */
+export async function startShowDual(
+  context: BrowserContext,
+  consolePage: Page,
+  waitHud = true
+): Promise<{ main: Page; backup: Page }> {
+  const pages: Page[] = [];
+  const onPage = (p: Page) => pages.push(p);
+  context.on('page', onPage);
+  await consolePage.getByTestId('start-show').click();
+  // 两个弹窗都到达（超时放宽到 10s，覆盖弱机顺序抖动）。
+  await expect
+    .poll(async () => pages.length, { timeout: 10_000 })
+    .toBeGreaterThanOrEqual(2);
+  context.off('page', onPage);
+  const roleOf = async (p: Page) => {
+    await p.waitForLoadState('load').catch(() => undefined);
+    try {
+      return new URL(p.url()).searchParams.get('role');
+    } catch {
+      return null;
+    }
+  };
+  const byRole = new Map<string, Page>();
+  for (const p of pages) {
+    const role = await roleOf(p);
+    if (role === 'main' || role === 'backup') byRole.set(role, p);
+  }
+  const main = byRole.get('main');
+  const backup = byRole.get('backup');
+  if (!main || !backup) throw new Error('双屏开窗失败：未同时取得主/备观众窗');
+  if (waitHud) {
+    await expect(main.getByTestId('viewer-hud')).toBeVisible({ timeout: 10_000 });
+    await expect(backup.getByTestId('viewer-hud')).toBeVisible({ timeout: 10_000 });
+  }
+  return { main, backup };
+}
+
+/** 读取观众窗角色徽标（主投影/备用投影）。 */
+export async function viewerRole(viewer: Page): Promise<string> {
+  return (await viewer.getByTestId('viewer-role').innerText()).trim();
+}
+
+/** 读取双屏观众窗的阶段徽标文案（准备中/部分显示/已确认…）。 */
+export async function dualStageText(viewer: Page): Promise<string> {
+  const badge = viewer.getByTestId('dual-stage-badge');
+  if ((await badge.count()) === 0) return '';
+  return (await badge.innerText()).replace(/\s+/g, ' ').trim();
+}
+
 /** 读取观众窗 HUD 文本（如“第 2 / 3 页”或“遮黑”）；恢复期间无 HUD 时返回空串。 */
 export async function hudText(viewer: Page): Promise<string> {
   const hud = viewer.getByTestId('viewer-hud');
@@ -564,4 +617,283 @@ export async function storageErrorOp(consolePage: Page): Promise<string | null> 
   const banner = consolePage.getByTestId('storage-error');
   if ((await banner.count()) === 0) return null;
   return banner.getAttribute('data-op');
+}
+
+// ---- 可控消息顺序（BroadcastChannel 拦截/挂起/定向丢弃） ------------------
+
+/**
+ * 在任何应用脚本之前安装消息顺序控制器。可在任意页面（控制台或观众窗）注入，
+ * 用来确定性地复现：单侧 ACK 延迟/丢失、SHOW 只到达一侧、ABORT 迟到等。
+ *
+ * 页面内通过 window.__domeMsgCtl 使用：
+ *   hold(kind | predicate)   此后命中的“收到的消息”进入挂起队列（不投递）
+ *   drop(kind | predicate)   命中的“收到的消息”直接丢弃
+ *   release(kind?)           放行挂起队列（可只放行某 kind；按到达顺序）
+ *   releaseAll()             放行全部挂起消息
+ *   clear()                  解除所有 hold/drop 规则（挂起队列保留）
+ *   held(kind?)              当前挂起数量
+ *
+ * 规则作用于“本窗口接收到的”消息；post 不受影响（要让某侧发不出，在发送侧
+ * 安装并匹配出站消息，见 installOutgoingMsgCtl）。
+ */
+export interface MsgMatcher {
+  kind?: string;
+  stage?: string;
+  role?: string;
+  viewerIdIncludes?: string;
+}
+
+export async function installIncomingMsgCtl(context: BrowserContext): Promise<void> {
+  await context.addInitScript(() => {
+    type MsgMatcher = {
+      kind?: string;
+      stage?: string;
+      role?: string;
+      viewerIdIncludes?: string;
+    };
+    const W = window as unknown as {
+      __domeMsgCtl?: {
+        hold: (m: MsgMatcher) => void;
+        drop: (m: MsgMatcher) => void;
+        release: (kind?: string) => number;
+        releaseAll: () => number;
+        clear: () => void;
+        held: (kind?: string) => number;
+      };
+    };
+    if (W.__domeMsgCtl) return;
+
+    type Rule = (msg: Record<string, unknown>) => boolean;
+    const holds: Rule[] = [];
+    const drops: Rule[] = [];
+    const queue: Array<{ msg: unknown; deliver: () => void }> = [];
+    // 匹配器只允许可序列化的字段描述符（函数无法跨 evaluate 传递）。
+    const toRule = (m: MsgMatcher): Rule => (msg) => {
+      if (m.kind && (msg as { kind?: string }).kind !== m.kind) return false;
+      if (m.stage && (msg as { stage?: string }).stage !== m.stage) return false;
+      if (m.role && (msg as { role?: string }).role !== m.role) return false;
+      if (m.viewerIdIncludes) {
+        const id = (msg as { viewerId?: string }).viewerId ?? '';
+        if (!id.includes(m.viewerIdIncludes)) return false;
+      }
+      return true;
+    };
+
+    const Orig = BroadcastChannel;
+    function PatchedBC(this: unknown, name: string): BroadcastChannel {
+      const ch: BroadcastChannel = new Orig(name);
+      // 应用通过“属性赋值”channel.onmessage = fn 注册监听（而非 addEventListener）。
+      // 为完全掌控入站消息，在实例上用访问器遮蔽原型的 onmessage：setter 把处理函数
+      // 存入闭包，getter 对原生事件派发返回 null（从而原生不会直接调用它），
+      // 唯一真实监听（addEventListener）在此做挂起/丢弃分流后再调用闭包中的处理函数。
+      let stored: ((ev: MessageEvent) => void) | null = null;
+      Object.defineProperty(ch, 'onmessage', {
+        configurable: true,
+        enumerable: true,
+        get() {
+          return null;
+        },
+        set(fn: unknown) {
+          stored = typeof fn === 'function' ? (fn as (ev: MessageEvent) => void) : null;
+        }
+      });
+      const dispatch = (msg: unknown) => {
+        if (stored) stored({ data: msg } as MessageEvent);
+      };
+      Orig.prototype.addEventListener.call(ch, 'message', (ev: Event) => {
+        const msg = (ev as MessageEvent).data as Record<string, unknown>;
+        if (drops.some((r) => r(msg))) return;
+        if (holds.some((r) => r(msg))) {
+          queue.push({ msg, deliver: () => dispatch(msg) });
+          return;
+        }
+        dispatch(msg);
+      });
+      return ch;
+    }
+    PatchedBC.prototype = Orig.prototype;
+    window.BroadcastChannel = PatchedBC as unknown as typeof BroadcastChannel;
+
+    W.__domeMsgCtl = {
+      hold(m) {
+        holds.push(toRule(m));
+      },
+      drop(m) {
+        drops.push(toRule(m));
+      },
+      release(kind) {
+        const matched = queue.filter(
+          (q) => !kind || (q.msg as { kind?: string }).kind === kind
+        );
+        for (const q of matched) queue.splice(queue.indexOf(q), 1);
+        // 在微任务后投递，避免“边遍历边触发新消息”改变队列
+        matched.forEach((q) => setTimeout(() => q.deliver(), 0));
+        return matched.length;
+      },
+      releaseAll() {
+        const all = queue.splice(0, queue.length);
+        all.forEach((q) => setTimeout(() => q.deliver(), 0));
+        return all.length;
+      },
+      clear() {
+        holds.length = 0;
+        drops.length = 0;
+      },
+      held(kind) {
+        return kind
+          ? queue.filter((q) => (q.msg as { kind?: string }).kind === kind).length
+          : queue.length;
+      }
+    };
+  });
+}
+
+export interface MsgCtlHandle {
+  hold: (matcher: MsgMatcher) => Promise<void>;
+  drop: (matcher: MsgMatcher) => Promise<void>;
+  release: (kind?: string) => Promise<number>;
+  releaseAll: () => Promise<number>;
+  clear: () => Promise<void>;
+  held: (kind?: string) => Promise<number>;
+}
+
+export function msgCtl(page: Page): MsgCtlHandle {
+  const call =
+    (method: string) =>
+    (...args: unknown[]) =>
+      page.evaluate(
+        ({ m, a }) => {
+          const ctl = (
+            window as unknown as {
+              __domeMsgCtl: Record<string, (...x: unknown[]) => unknown>;
+            }
+          ).__domeMsgCtl;
+          return ctl[m](...a) as never;
+        },
+        { m: method, a: args }
+      );
+  return {
+    hold: call('hold'),
+    drop: call('drop'),
+    release: call('release'),
+    releaseAll: call('releaseAll'),
+    clear: call('clear'),
+    held: call('held')
+  };
+}
+
+/**
+ * 出站消息控制：在发送侧拦截 postMessage（用于让某块屏幕“发不出”某类回执，
+ * 或把发出的消息挂起后再统一放行）。语义与入站控制对称。
+ */
+export async function installOutgoingMsgCtl(context: BrowserContext): Promise<void> {
+  await context.addInitScript(() => {
+    type MsgMatcher = {
+      kind?: string;
+      stage?: string;
+      role?: string;
+      viewerIdIncludes?: string;
+    };
+    const W = window as unknown as {
+      __domeOutCtl?: {
+        hold: (m: MsgMatcher) => void;
+        drop: (m: MsgMatcher) => void;
+        release: (kind?: string) => number;
+        releaseAll: () => number;
+        clear: () => void;
+        held: (kind?: string) => number;
+      };
+    };
+    if (W.__domeOutCtl) return;
+    type Rule = (msg: Record<string, unknown>) => boolean;
+    const holds: Rule[] = [];
+    const drops: Rule[] = [];
+    const queue: Array<{ msg: unknown; send: () => void }> = [];
+    const toRule = (m: MsgMatcher): Rule => (msg) => {
+      if (m.kind && (msg as { kind?: string }).kind !== m.kind) return false;
+      if (m.stage && (msg as { stage?: string }).stage !== m.stage) return false;
+      if (m.role && (msg as { role?: string }).role !== m.role) return false;
+      if (m.viewerIdIncludes) {
+        const id = (msg as { viewerId?: string }).viewerId ?? '';
+        if (!id.includes(m.viewerIdIncludes)) return false;
+      }
+      return true;
+    };
+
+    const Orig = BroadcastChannel;
+    function PatchedBC(this: unknown, name: string): BroadcastChannel {
+      const ch: BroadcastChannel = new Orig(name);
+      const post = ch.postMessage.bind(ch);
+      ch.postMessage = (msg: unknown) => {
+        const m = msg as Record<string, unknown>;
+        if (drops.some((r) => r(m))) return;
+        if (holds.some((r) => r(m))) {
+          queue.push({ msg, send: () => post(msg) });
+          return;
+        }
+        post(msg);
+      };
+      return ch;
+    }
+    PatchedBC.prototype = Orig.prototype;
+    window.BroadcastChannel = PatchedBC as unknown as typeof BroadcastChannel;
+
+    W.__domeOutCtl = {
+      hold(m) {
+        holds.push(toRule(m));
+      },
+      drop(m) {
+        drops.push(toRule(m));
+      },
+      release(kind) {
+        const matched = queue.filter(
+          (q) => !kind || (q.msg as { kind?: string }).kind === kind
+        );
+        for (const q of matched) {
+          queue.splice(queue.indexOf(q), 1);
+          q.send();
+        }
+        return matched.length;
+      },
+      releaseAll() {
+        const all = queue.splice(0, queue.length);
+        all.forEach((q) => q.send());
+        return all.length;
+      },
+      clear() {
+        holds.length = 0;
+        drops.length = 0;
+      },
+      held(kind) {
+        return kind
+          ? queue.filter((q) => (q.msg as { kind?: string }).kind === kind).length
+          : queue.length;
+      }
+    };
+  });
+}
+
+export function outMsgCtl(page: Page): MsgCtlHandle {
+  const call =
+    (method: string) =>
+    (...args: unknown[]) =>
+      page.evaluate(
+        ({ m, a }) => {
+          const ctl = (
+            window as unknown as {
+              __domeOutCtl: Record<string, (...x: unknown[]) => unknown>;
+            }
+          ).__domeOutCtl;
+          return ctl[m](...a) as never;
+        },
+        { m: method, a: args }
+      );
+  return {
+    hold: call('hold'),
+    drop: call('drop'),
+    release: call('release'),
+    releaseAll: call('releaseAll'),
+    clear: call('clear'),
+    held: call('held')
+  };
 }

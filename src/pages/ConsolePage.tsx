@@ -9,6 +9,7 @@ export function ConsolePage() {
   const controller = controllerRef.current;
   const [, force] = useReducer((x: number) => x + 1, 0);
   const [selected, setSelected] = useState<number | null>(null);
+  const [dualMode, setDualMode] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -146,11 +147,24 @@ export function ConsolePage() {
               <button
                 className="btn btn-primary btn-large"
                 disabled={draft.items.length === 0}
-                onClick={() => void controller.startShow()}
+                onClick={() => void controller.startShow(dualMode ? 'dual' : 'single')}
                 data-testid="start-show"
               >
-                开始放映并打开观众窗
+                {dualMode ? '开始正式讲解并打开主/备双屏' : '开始放映并打开观众窗'}
               </button>
+              <label className="mode-choice" data-testid="dual-mode-toggle">
+                <input
+                  type="checkbox"
+                  checked={dualMode}
+                  onChange={(e) => setDualMode(e.target.checked)}
+                  data-testid="dual-mode-checkbox"
+                />
+                <span>
+                  双屏确认模式（正式讲解）：主投影 + 备用投影两扇窗；两侧先分别装载、
+                  双双准备完成后统一切换，两侧显示均匹配且落库成功才记为已确认；
+                  任一侧失败/超时则回滚到上一张已确认画面。
+                </span>
+              </label>
               {popup === 'blocked' && (
                 <div className="popup-blocked" data-testid="popup-blocked">
                   POPUP_BLOCKED：浏览器拦截了观众窗弹窗，会话已保留。
@@ -171,7 +185,13 @@ export function ConsolePage() {
                 <div className="seq-line mono">
                   权威序号 seq={session!.lastConfirmed.seq}
                 </div>
-                <PendingIndicator pending={pending} onRetry={() => void controller.retry()} />
+                {session!.mode === 'dual' && (
+                  <DualPhasePanel
+                    pending={pending}
+                    roleViewers={controller.roleViewerIds()}
+                  />
+                )}
+                <PendingIndicator pending={pending} dual={session!.mode === 'dual'} onRetry={() => void controller.retry()} />
               </div>
 
               <div className="control-grid">
@@ -212,9 +232,20 @@ export function ConsolePage() {
               {popup === 'blocked' && (
                 <div className="popup-blocked" data-testid="popup-blocked">
                   POPUP_BLOCKED：观众窗弹窗被拦截，会话仍在运行。
-                  <button className="btn" onClick={() => controller.openViewer()}>
-                    重试打开观众窗
-                  </button>
+                  {session!.mode === 'dual' ? (
+                    <span className="dual-open-row">
+                      <button className="btn" onClick={() => controller.openRole('main')}>
+                        重试打开主投影
+                      </button>
+                      <button className="btn" onClick={() => controller.openRole('backup')}>
+                        重试打开备用投影
+                      </button>
+                    </span>
+                  ) : (
+                    <button className="btn" onClick={() => controller.openViewer()}>
+                      重试打开观众窗
+                    </button>
+                  )}
                 </div>
               )}
               <div className="viewer-count muted">
@@ -248,7 +279,7 @@ function SlideRow(props: {
   frozen: boolean;
   isCurrent: boolean;
   isPendingTarget: boolean;
-  pendingStatus: 'pending' | 'unconfirmed' | 'failed' | null;
+  pendingStatus: 'pending' | 'preparing' | 'partial' | 'unconfirmed' | 'failed' | null;
   selected: boolean;
   onSelect: () => void;
   onMoveUp: () => void;
@@ -280,6 +311,16 @@ function SlideRow(props: {
         {props.pendingStatus === 'pending' && (
           <span className="mark mark-pending" data-testid={`pending-${index}`}>
             待确认…
+          </span>
+        )}
+        {props.pendingStatus === 'preparing' && (
+          <span className="mark mark-pending" data-testid={`preparing-${index}`}>
+            双屏准备中…
+          </span>
+        )}
+        {props.pendingStatus === 'partial' && (
+          <span className="mark mark-partial" data-testid={`partial-${index}`}>
+            部分显示（未确认）
           </span>
         )}
         {props.pendingStatus === 'unconfirmed' && (
@@ -340,16 +381,119 @@ function GotoBox(props: { total: number; disabled: boolean; onGoto: (page: numbe
   );
 }
 
+function roleLabel(role: 'main' | 'backup'): string {
+  return role === 'main' ? '主投影' : '备用投影';
+}
+
+/**
+ * 双屏确认面板：准确区分三种切换状态——
+ *  - 准备中（preparing）：两侧尚在分别装载；
+ *  - 部分显示（partial）：SHOW 已下发，只有一侧回报显示；
+ *  - 已确认：无未决命令时权威画面与两块屏幕一致。
+ * 不承诺两块屏幕像素物理同时变化，但每块屏幕所处阶段分别可见。
+ */
+function DualPhasePanel(props: {
+  pending: {
+    status: string;
+    seq: number;
+    attempts: number;
+    target: { page: number; blackout: boolean };
+    dual?: {
+      prepared: { main: boolean; backup: boolean };
+      shown: { main: boolean; backup: boolean };
+    };
+  } | null;
+  roleViewers: Partial<Record<'main' | 'backup', string>>;
+}) {
+  const p = props.pending;
+  let phaseLabel = '已确认：主/备双屏与权威画面一致';
+  let phaseTestId = 'dual-phase-confirmed';
+  if (p) {
+    if (p.status === 'preparing') {
+      phaseLabel = '准备中：两侧观众窗分别装载目标画面';
+      phaseTestId = 'dual-phase-preparing';
+    } else if (p.status === 'partial') {
+      phaseLabel = '部分显示：仅一侧已切换，等待另一侧显示回执';
+      phaseTestId = 'dual-phase-partial';
+    } else if (p.status === 'unconfirmed') {
+      phaseLabel = '未确认：命令保持未确认，已显示侧回滚到上一张已确认画面';
+      phaseTestId = 'dual-phase-unconfirmed';
+    } else if (p.status === 'failed') {
+      phaseLabel = '呈现失败：双屏保持上一张已确认画面';
+      phaseTestId = 'dual-phase-failed';
+    }
+  }
+  const prepared = p?.dual?.prepared;
+  const shown = p?.dual?.shown;
+  return (
+    <div className="dual-panel" data-testid="dual-panel">
+      <div className="dual-phase" data-testid={phaseTestId}>
+        {phaseLabel}
+        {p && <span className="mono">（seq={p.seq}，第 {p.attempts} 轮尝试）</span>}
+      </div>
+      <div className="dual-screens">
+        {(['main', 'backup'] as const).map((role) => {
+          let stage = '已确认画面';
+          let cls = 'screen-ok';
+          if (p) {
+            if (shown?.[role]) {
+              stage = '已显示（待双确认）';
+              cls = 'screen-partial';
+            } else if (prepared?.[role]) {
+              stage = p.status === 'partial' ? '准备完成 · 待切换' : '准备完成，等待对侧';
+              cls = 'screen-prepared';
+            } else {
+              stage = '准备中…';
+              cls = 'screen-preparing';
+            }
+            if (p.status === 'unconfirmed' || p.status === 'failed') {
+              stage = '回到上一张已确认画面';
+              cls = 'screen-rollback';
+            }
+          }
+          return (
+            <div key={role} className={`dual-screen ${cls}`} data-testid={`dual-screen-${role}`}>
+              <span className="dual-screen-name">{roleLabel(role)}</span>
+              <span className="dual-screen-stage" data-testid={`dual-stage-${role}`}>
+                {stage}
+              </span>
+              <span className="mono dual-screen-id">
+                {props.roleViewers[role] ? '在线' : '未连接'}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function PendingIndicator(props: {
   pending: { status: string; seq: number; attempts: number } | null;
+  dual?: boolean;
   onRetry: () => void;
 }) {
   const p = props.pending;
-  if (!p) return <div className="muted ok-line">观众窗已确认，控制标记与穹顶画面一致。</div>;
+  if (!p) {
+    if (props.dual) return null; // 双屏面板的“已确认”行已表达该状态
+    return <div className="muted ok-line">观众窗已确认，控制标记与穹顶画面一致。</div>;
+  }
   if (p.status === 'pending')
     return (
       <div className="status-line status-pending" data-testid="status-pending">
         待确认（seq={p.seq}，第 {p.attempts} 次发送）…
+      </div>
+    );
+  if (p.status === 'preparing')
+    return (
+      <div className="status-line status-preparing" data-testid="status-preparing">
+        准备中（seq={p.seq}，第 {p.attempts} 轮）：等待主/备两侧准备回执…
+      </div>
+    );
+  if (p.status === 'partial')
+    return (
+      <div className="status-line status-partial" data-testid="status-partial">
+        部分显示（seq={p.seq}，第 {p.attempts} 轮）：仅一侧已切换，权威画面尚未更新…
       </div>
     );
   if (p.status === 'unconfirmed')
@@ -357,7 +501,7 @@ function PendingIndicator(props: {
       <div className="status-line status-unconfirmed" data-testid="status-unconfirmed">
         未确认（seq={p.seq}）· 画面仍停留在最后已确认页
         <button className="btn btn-mini" onClick={props.onRetry} data-testid="retry">
-          重试（沿用 seq={p.seq}）
+          重试（沿用 seq={p.seq}，新一轮回执）
         </button>
       </div>
     );
@@ -403,6 +547,8 @@ function StorageBanner(props: { error: StorageError; onRetry: () => void }) {
     ack: '确认已到达但未能持久化：该页暂不能标记为已确认，磁盘仍保留未确认命令。',
     expire: '未确认状态未能持久化。',
     endShow: '停映清理失败：会话仍在运行，刷新会恢复本场放映；请重试结束。',
+    dualRollback:
+      '双屏回滚状态未能写入：两侧画面已收回上一张已确认页，请重试写入后再发起切换（新一轮回执）。',
     draft: '节目单草稿未能保存：磁盘保留上一版节目单。',
     addFiles: '图片导入未能完整写入（Blob 与草稿已一并回滚）。'
   };

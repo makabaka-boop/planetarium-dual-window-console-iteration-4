@@ -27,15 +27,21 @@ import {
 } from '../db';
 import {
   Ack,
+  AbortMessage,
   CommandAction,
   CommandMessage,
+  ConfirmMode,
+  ConfirmedMessage,
   PendingCommand,
   Program,
+  ScreenRole,
   SessionRecord,
+  ShowMessage,
   SlideItem,
   SnapshotRequest,
   SnapshotResponse,
   WireMessage,
+  emptyDualProgress,
   makeSessionId
 } from '../protocol/types';
 import {
@@ -45,12 +51,24 @@ import {
   retryPending,
   startSession
 } from '../protocol/console';
+import {
+  expireDualPending,
+  issueDual,
+  receivePreparedAck,
+  receiveShownAck,
+  retryDual,
+  rollbackAfterConfirmFailure
+} from '../protocol/dual-console';
+import { DEFAULT_ACK_TIMEOUT_MS } from '../protocol/types';
 
 export type PopupStatus = 'none' | 'open' | 'blocked';
 
+/** 双屏模式下两块屏幕各自的开窗状态（弹窗是否成功接住）。 */
+export type DualPopupStatus = Record<ScreenRole, PopupStatus>;
+
 /** 存储失败的可重试上下文：operation 决定重试按钮重放哪个动作。 */
 export type StorageOperation =
-  | { kind: 'startShow' }
+  | { kind: 'startShow'; mode?: ConfirmMode }
   | { kind: 'command'; action: CommandAction }
   | { kind: 'retry' }
   | { kind: 'ack' }
@@ -58,7 +76,8 @@ export type StorageOperation =
   | { kind: 'endShow' }
   | { kind: 'draft' }
   | { kind: 'addFiles' }
-  | { kind: 'init' };
+  | { kind: 'init' }
+  | { kind: 'dualRollback' };
 
 export interface StorageError {
   operation: StorageOperation;
@@ -132,6 +151,12 @@ export class ConsoleController {
   /** 恢复中的观众窗（按 viewerId 去重；轮询快照不会重复计数）。 */
   private recovering = new Set<string>();
   /**
+   * 双屏模式：角色 -> 最近一次申报该角色的 viewerId。窗口重载后新 viewerId
+   * 会取代旧值；控制台据此判断“某块屏幕中途换了窗口”，并令未完成的切换
+   * 回到未确认（旧窗口的迟到回执按 viewerId 不再代表该角色）。
+   */
+  private roleViewers: Partial<Record<ScreenRole, string>> = {};
+  /**
    * 会话持久化串行队列。每个排队项携带它所基于的“磁盘前置会话”：
    * 真正落库时若内存会话已不是该前置（说明它已被一次失败/后续操作取代），
    * 该项作废，绝不把陈旧状态写到当前记录之上。
@@ -143,6 +168,10 @@ export class ConsoleController {
    * 一次落库（不会出现“首个提交失败、重复提交随后成功”导致的内存/磁盘分裂）。
    */
   private acksInFlight = new Set<string>();
+  /** 双屏：进行中的“两侧齐备 → 权威落库”指纹（防止重复 SHOWN 触发二次落库）。 */
+  private dualConfirmsInFlight = new Set<string>();
+  /** 双屏：已处理的阶段失败回执（同 attempt+stage+role 的重复失败只回滚一次）。 */
+  private dualFailuresSeen = new Set<string>();
 
   constructor(bus?: MessageBus) {
     this.bus = bus ?? new MessageBus();
@@ -159,14 +188,26 @@ export class ConsoleController {
       if (session) {
         // 刷新恢复：会话仍是权威来源；未决命令在恢复后一律视为未确认（不自动重试，
         // 由讲解员决定，序号沿用原序号）。
-        const restored = session.pending
+        let restored = session.pending
           ? { ...session, pending: { ...session.pending, status: 'unconfirmed' as const } }
           : session;
+        if (restored.mode === 'dual' && restored.pending) {
+          // 双屏模式的两侧回执只是当次进程内的临时进度：刷新后一律清空，
+          // 重试必须重新走完整的“两侧准备 → 两侧显示”握手，绝不借用旧回执。
+          restored = {
+            ...restored,
+            pending: {
+              ...restored.pending,
+              dual: { prepared: emptyDualProgress(), shown: emptyDualProgress() }
+            }
+          };
+        }
         // 恢复“已尝试但未持久化”的操作提示：仅当它属于当前磁盘会话
         // （旧会话/已结束会话的残留一律丢弃，不复活任何状态）。
         const unsynced = readUnsynced();
         const validUnsynced = unsynced && unsynced.sessionId === restored.sessionId ? unsynced : null;
         if (unsynced && !validUnsynced) writeUnsynced(null);
+        this.roleViewers = {};
         this.state = {
           ...this.state,
           session: restored,
@@ -300,7 +341,7 @@ export class ConsoleController {
         await this.init();
         return this.state.storageError === null;
       case 'startShow':
-        await this.justStartShow();
+        await this.justStartShow(op.mode ?? 'single');
         return this.state.storageError === null;
       case 'command':
         await this.command(op.action);
@@ -313,6 +354,11 @@ export class ConsoleController {
         // 内存/磁盘权威仍是未确认状态，观众窗对重复命令只重放 ACK 或重新呈现。
         if (this.state.unsynced) await this.retryUnsynced();
         else await this.retry();
+        return this.state.storageError === null;
+      case 'dualRollback':
+        // 双屏阶段失败后的回滚命令（ABORT）落库失败：重试先收敛回滚态，
+        // 再由讲解员显式重试切换（新 attempt，不借用旧回执）。
+        await this.retryDualRollback();
         return this.state.storageError === null;
       case 'expire':
         this.tick(true);
@@ -429,25 +475,26 @@ export class ConsoleController {
    * 弹窗受阻时：会话已建立并持久化（保留会话），popup = 'blocked'，
    * 讲解员可稍后“重试打开观众窗”，观众窗打开后通过快照收敛。
    */
-  async startShow(): Promise<PopupStatus> {
-    return this.justStartShow();
+  async startShow(mode: ConfirmMode = 'single'): Promise<PopupStatus> {
+    return this.justStartShow(mode);
   }
 
-  private async justStartShow(): Promise<PopupStatus> {
+  private async justStartShow(mode: ConfirmMode): Promise<PopupStatus> {
     if (this.state.session?.running) return this.state.popup;
     const usable = this.state.draft.items;
     if (usable.length === 0) return this.state.popup;
 
     const sessionId = makeSessionId();
-    let session = startSession(sessionId, usable.length);
+    let session = startSession(sessionId, usable.length, Date.now(), mode);
     session = { ...session, frozenProgram: { items: usable } };
     this.recovering.clear();
+    this.roleViewers = {};
     try {
       // 冻结节目单（frozen:<sid>、frozen:latest）与 current 会话同一事务：
       // 任一写入最终中止则全部回滚，绝不会只冻结没会话、或有会话没节目单。
       await saveFrozenAndSession(session);
     } catch (err) {
-      this.failStorage({ kind: 'startShow' }, err);
+      this.failStorage({ kind: 'startShow', mode }, err);
       return this.state.popup;
     }
     // 落库已确定成功：现在才宣布运行与冻结。新会话不携带任何旧的未同步操作。
@@ -460,7 +507,7 @@ export class ConsoleController {
       storageError: null,
       unsynced: null
     };
-    const status = this.openViewer();
+    const status = mode === 'dual' ? this.openDualViewers() : this.openViewer();
     this.state = { ...this.state, popup: status };
     this.emit();
     return status;
@@ -485,13 +532,64 @@ export class ConsoleController {
     return 'open';
   }
 
+  /**
+   * 双屏模式：在同一次用户手势内连续打开主投影与备用投影两个窗口
+   * （命名窗口 dome-viewer-main / dome-viewer-backup，刷新/重试复用同一窗口）。
+   * 任一被拦截都报告 POPUP_BLOCKED，但会话已建立并持久保留，讲解员放行后
+   * 可逐块重试打开；窗口打开后仍通过快照精确同步。
+   */
+  private openDualViewers(): PopupStatus {
+    const results: DualPopupStatus = { main: 'none', backup: 'none' };
+    (['main', 'backup'] as ScreenRole[]).forEach((role) => {
+      results[role] = this.openRoleWindow(role);
+    });
+    return results.main === 'blocked' || results.backup === 'blocked' ? 'blocked' : 'open';
+  }
+
+  private openRoleWindow(role: ScreenRole): PopupStatus {
+    const url = `${window.location.origin}/viewer?role=${role}`;
+    let win: Window | null = null;
+    try {
+      win = window.open(url, `dome-viewer-${role}`);
+    } catch {
+      win = null;
+    }
+    return win ? 'open' : 'blocked';
+  }
+
+  /** 重试打开指定角色的观众窗（POPUP_BLOCKED 解除后使用）。 */
+  openRole(role: ScreenRole): PopupStatus {
+    const status = this.openRoleWindow(role);
+    this.state = {
+      ...this.state,
+      popup: status === 'open' && this.state.popup === 'blocked' ? 'open' : this.state.popup
+    };
+    this.emit();
+    return status;
+  }
+
+  /** 当前会话是否为双屏确认模式。 */
+  isDualMode(): boolean {
+    return this.state.session?.mode === 'dual';
+  }
+
+  /** 双屏模式下各角色当前对应的 viewerId（供 UI 展示在线状态）。 */
+  roleViewerIds(): Partial<Record<ScreenRole, string>> {
+    return { ...this.roleViewers };
+  }
+
   private post(msg: WireMessage) {
     this.bus.post(msg);
   }
 
   private tick(manual = false) {
     const s = this.state.session;
-    if (!s?.running || !s.pending || s.pending.status !== 'pending') return;
+    if (!s?.running || !s.pending) return;
+    if (s.mode === 'dual') {
+      this.tickDual(s, manual);
+      return;
+    }
+    if (s.pending.status !== 'pending') return;
     const next = expirePending(s);
     if (next === s) return;
     void this.commitSession(next, s, { kind: 'expire' }, (v) =>
@@ -502,13 +600,43 @@ export class ConsoleController {
   }
 
   /**
+   * 双屏超时：preparing（两侧未准备齐）或 partial（只有一侧显示）超时，
+   * 权威画面不变，命令保持未确认；回滚状态先落库，随后 ABORT 让已先行
+   * 显示的一侧回到上一张已确认画面。落库失败则只挂存储错误（不发 ABORT，
+   * 由重试入口再次收敛）。
+   */
+  private tickDual(s: SessionRecord, manual: boolean) {
+    const next = expireDualPending(s, Date.now(), DEFAULT_ACK_TIMEOUT_MS);
+    if (next === s) return;
+    const abort: AbortMessage = {
+      kind: 'ABORT',
+      sessionId: s.sessionId,
+      seq: s.pending!.seq,
+      page: s.pending!.target.page,
+      blackout: s.pending!.target.blackout,
+      attempt: s.pending!.attempts
+    };
+    void this.commitSession(next, s, { kind: 'expire' }, (v) => saveSession(v!, 'expire')).then(
+      (ok) => {
+        if (ok) this.post(abort);
+        else if (manual) this.emit();
+      }
+    );
+  }
+
+  /**
    * 讲解员发出一条命令：先持久化（待确认命令随会话落库），落库成功后才把
    * 命令发往观众窗并宣布“待确认”。持久化失败则不发命令、内存权威不变
    * （观众窗不会收到一个刷新后无法解释的新画面），给出可重试状态。
+   * 双屏模式发出的是装载阶段命令（phase=prepare），UI 进入“准备中”。
    */
   async command(action: CommandAction): Promise<void> {
     const s = this.state.session;
     if (!s?.running) return;
+    if (s.mode === 'dual') {
+      await this.commandDual(action);
+      return;
+    }
     const { session: next, command } = issue(s, action);
     if (!command || next === s) return; // 叠加拒绝 / 空操作
     const ok = await this.commitSession(next, s, { kind: 'command', action }, (v) =>
@@ -517,6 +645,22 @@ export class ConsoleController {
     if (!ok) {
       // 命令未持久化：内存/磁盘权威不变，命令也未发出；登记可重试操作，
       // 即使刷新控制台，讲解员仍有明确的重试入口收敛画面。
+      if (this.state.session === s) this.rememberUnsynced(s.sessionId, action, 'command');
+      return;
+    }
+    this.forgetUnsynced();
+    this.post(command);
+  }
+
+  private async commandDual(action: CommandAction): Promise<void> {
+    const s = this.state.session;
+    if (!s || s.mode !== 'dual') return;
+    const { session: next, command } = issueDual(s, action);
+    if (!command || next === s) return; // 叠加拒绝 / 空操作
+    const ok = await this.commitSession(next, s, { kind: 'command', action }, (v) =>
+      saveSession(v!)
+    );
+    if (!ok) {
       if (this.state.session === s) this.rememberUnsynced(s.sessionId, action, 'command');
       return;
     }
@@ -541,11 +685,32 @@ export class ConsoleController {
   async retry(): Promise<void> {
     const s = this.state.session;
     if (!s?.running || !s.pending) return;
+    if (s.mode === 'dual') {
+      await this.retryDualCmd(s);
+      return;
+    }
     const { session: next, command } = retryPending(s);
     if (!command) return;
     const ok = await this.commitSession(next, s, { kind: 'retry' }, (v) => saveSession(v!));
     if (!ok) {
       this.rememberUnsynced(s.sessionId, s.pending.action, 'retry');
+      return;
+    }
+    this.forgetUnsynced();
+    this.post(command);
+  }
+
+  /**
+   * 双屏重试：序号不变、attempts+1，两侧回执进度清空后重新落库，
+   * 再发新一轮 prepare。旧 attempt 的 PREPARED/SHOWN 全部作废，
+   * 两侧窗口收到新 attempt 的 prepare 时会自行先回到权威帧再装载。
+   */
+  private async retryDualCmd(s: SessionRecord): Promise<void> {
+    const { session: next, command } = retryDual(s);
+    if (!command) return;
+    const ok = await this.commitSession(next, s, { kind: 'retry' }, (v) => saveSession(v!));
+    if (!ok) {
+      this.rememberUnsynced(s.sessionId, s.pending!.action, 'retry');
       return;
     }
     this.forgetUnsynced();
@@ -583,6 +748,7 @@ export class ConsoleController {
     if (!ok) return;
     this.bus.post({ kind: 'SESSION_ENDED', sessionId: s.sessionId });
     this.recovering.clear();
+    this.roleViewers = {};
     this.forgetUnsynced();
     this.state = {
       ...this.state,
@@ -608,7 +774,8 @@ export class ConsoleController {
         this.handleSnapshotReq(msg);
         break;
       case 'ACK':
-        this.handleAck(msg);
+        if (this.state.session?.mode === 'dual') this.handleDualAck(msg);
+        else this.handleAck(msg);
         break;
       default:
         break;
@@ -636,28 +803,104 @@ export class ConsoleController {
       running: s.running,
       confirmed: s.lastConfirmed,
       pending: s.pending,
-      viewerId: req.viewerId
+      viewerId: req.viewerId,
+      mode: s.mode,
+      role: req.role
     };
     this.post(res);
-    // 恢复后若有未决命令（pending/unconfirmed/failed 不自动补发，避免对 failed
-    // 命令在图片仍坏时形成风暴）；仅当未决仍是 pending（正在等待该新窗口确认）
-    // 时立刻重放一次，便于新窗口快速同步。
-    if (s.pending && s.pending.status === 'pending') {
-      const cmd: CommandMessage = {
-        kind: 'CMD',
-        sessionId: s.sessionId,
-        seq: s.pending.seq,
-        action: s.pending.action,
-        page: s.pending.target.page,
-        blackout: s.pending.target.blackout
-      };
-      this.post(cmd);
+
+    if (s.mode === 'dual') {
+      this.handleDualSnapshotRole(s, req);
+    } else {
+      // 恢复后若有未决命令（pending/unconfirmed/failed 不自动补发，避免对 failed
+      // 命令在图片仍坏时形成风暴）；仅当未决仍是 pending（正在等待该新窗口确认）
+      // 时立刻重放一次，便于新窗口快速同步。
+      if (s.pending && s.pending.status === 'pending') {
+        const cmd: CommandMessage = {
+          kind: 'CMD',
+          sessionId: s.sessionId,
+          seq: s.pending.seq,
+          action: s.pending.action,
+          page: s.pending.target.page,
+          blackout: s.pending.target.blackout
+        };
+        this.post(cmd);
+      }
     }
+
     if (s.running && !this.recovering.has(req.viewerId)) {
       this.recovering.add(req.viewerId);
       // 观众窗成功取得快照即证明窗口通路存在，解除 POPUP_BLOCKED 提示（会话不变）。
-      this.state = { ...this.state, recoveringViewers: this.recovering.size, popup: 'open' };
+      // 双屏模式下需两块屏幕都出现才视为通路齐备。
+      const popupOpen =
+        s.mode !== 'dual' ||
+        (this.roleViewers.main != null && this.roleViewers.backup != null);
+      this.state = {
+        ...this.state,
+        recoveringViewers: this.recovering.size,
+        popup: popupOpen ? 'open' : this.state.popup
+      };
       this.emit();
+    }
+  }
+
+  /**
+   * 双屏模式的角色登记与“换窗口”检测：
+   *  - 角色首次上报：记录 viewerId，若此时正有未决切换，该角色尚无本轮回执，
+   *    处于 preparing 时立即补发装载命令让新窗口加入；
+   *  - 同一 viewerId 周期轮询：幂等；
+   *  - 同一角色换了 viewerId（旧窗重载/关闭后新开）：旧窗口的一切在途回执对
+   *    控制台作废。若切换已进入 partial（可能已有屏幕先行显示），为避免两块
+   *    屏幕分裂，直接把命令打回未确认并 ABORT，由讲解员用新 attempt 重试
+   *    （新窗口重载后本身也已先同步到最后确认画面）。
+   */
+  private handleDualSnapshotRole(s: SessionRecord, req: SnapshotRequest) {
+    const role = req.role;
+    if (role !== 'main' && role !== 'backup') return;
+    const prev = this.roleViewers[role];
+    this.roleViewers[role] = req.viewerId;
+
+    const p = s.pending;
+    if (!p) return;
+    if (prev === req.viewerId) return; // 轮询或已登记
+
+    if (prev != null && (p.status === 'partial' || p.status === 'preparing')) {
+      // 该角色的窗口在切换中途被替换：旧回执作废，打回未确认并回滚已显示侧。
+      const next: SessionRecord = {
+        ...s,
+        pending: { ...p, status: 'unconfirmed', dual: p.dual ? { ...p.dual } : undefined }
+      };
+      const abort: AbortMessage = {
+        kind: 'ABORT',
+        sessionId: s.sessionId,
+        seq: p.seq,
+        page: p.target.page,
+        blackout: p.target.blackout,
+        attempt: p.attempts
+      };
+      // 先落库未确认回滚态，再发 ABORT（内存/磁盘权威一致后才宣布）。
+      void this.commitSession(next, s, { kind: 'dualRollback' }, (v) => saveSession(v!)).then(
+        (ok) => {
+          if (ok) this.post(abort);
+        }
+      );
+      return;
+    }
+
+    // 新窗口加入时若仍在准备阶段，定向补发本轮装载命令（携带新 attempt）。
+    if (p.status === 'preparing') {
+      const cmd: CommandMessage = {
+        kind: 'CMD',
+        sessionId: s.sessionId,
+        seq: p.seq,
+        action: p.action,
+        page: p.target.page,
+        blackout: p.target.blackout,
+        phase: 'prepare',
+        attempt: p.attempts,
+        viewerId: req.viewerId
+      };
+      this.post(cmd);
     }
   }
 
@@ -682,6 +925,162 @@ export class ConsoleController {
         this.rememberUnsynced(s.sessionId, pendingAction, 'ack');
       }
     });
+  }
+
+  /**
+   * 双屏确认模式的回执处理。三条纪律：
+   *  1. 只有会话/序号/目标/attempt/角色全部匹配当前未决命令的回执才有效
+   *     （纯函数内校验）——迟到、重复、异会话、上一轮尝试的旧回执一律丢弃；
+   *  2. 阶段推进（preparing→partial、单侧 SHOWN 计数）只在两侧齐备的关键点
+   *     落库；单侧进度是进程内临时状态，刷新即清空（重试不得借用旧回执）；
+   *  3. 两侧 SHOWN 匹配后仍须权威状态落库成功才广播 CONFIRMED；任一侧失败、
+   *     超时或存储失败都下发 ABORT，让已先行显示的一侧回到上一张已确认画面。
+   */
+  private handleDualAck(ack: Ack) {
+    const s = this.state.session;
+    if (!s || s.mode !== 'dual' || !s.pending) return;
+    if (ack.stage !== 'prepared' && ack.stage !== 'shown') return;
+
+    if (ack.stage === 'prepared') {
+      const r = receivePreparedAck(s, ack);
+      if (r.session === s && !r.show && !r.rollback) {
+        // 无效回执（迟到/异会话/旧 attempt）；唯一例外：两侧已齐备进入 partial
+        // 后收到的同轮重复 PREPARED（可能 SHOW 丢了），幂等重发一次 SHOW。
+        this.maybeResendShow(s, ack);
+        return;
+      }
+      if (r.rollback) {
+        this.dualStageFailure(s, r.session, r.rollback, ack, 'prepared');
+        return;
+      }
+      if (r.show) {
+        // 两侧准备回执匹配：先把“部分显示前”的阶段状态落库，再下发 SHOW。
+        void this.commitSession(r.session, s, { kind: 'ack' }, (v) => saveSession(v!)).then(
+          (ok) => {
+            if (ok) this.post(r.show!);
+            // 落库失败：不发 SHOW，两侧仍停在权威帧（仅完成装载），存储横幅可重试。
+          }
+        );
+        return;
+      }
+      // 单侧 PREPARED：仅更新内存临时进度（不落库、不改变权威）。
+      this.state = { ...this.state, session: r.session };
+      this.emit();
+      return;
+    }
+
+    // stage === 'shown'
+    const r = receiveShownAck(s, ack);
+    if (r.session === s && !r.confirmed && !r.rollback) return; // 无效回执
+    if (r.rollback) {
+      this.dualStageFailure(s, r.session, r.rollback, ack, 'shown');
+      return;
+    }
+    if (!r.confirmed) {
+      // 单侧 SHOWN：进入/保持“部分显示”（临时进度，不落库；partial 标记已在
+      // 下发 SHOW 前随两侧准备齐备落过一次）。
+      this.state = { ...this.state, session: r.session };
+      this.emit();
+      return;
+    }
+
+    // 两侧 SHOWN 匹配：去重后把权威前进落库；成功才广播 CONFIRMED。
+    const p = s.pending;
+    const fingerprint = `${s.sessionId}:${p.seq}:${p.attempts}:${p.target.page}:${p.target.blackout}`;
+    if (this.dualConfirmsInFlight.has(fingerprint)) return;
+    this.dualConfirmsInFlight.add(fingerprint);
+    const pendingAction = p.action;
+    void this.commitSession(r.session, s, { kind: 'ack' }, (v) => saveSession(v!)).then((ok) => {
+      this.dualConfirmsInFlight.delete(fingerprint);
+      if (ok) {
+        this.forgetUnsynced();
+        const c = r.session.lastConfirmed;
+        const confirmedMsg: ConfirmedMessage = {
+          kind: 'CONFIRMED',
+          sessionId: s.sessionId,
+          seq: c.seq,
+          page: c.page,
+          blackout: c.blackout
+        };
+        this.post(confirmedMsg);
+        return;
+      }
+      // 权威持久化失败：绝不宣布已确认。两侧穹顶必须回到上一张已确认画面
+      // （= 磁盘权威，画面回滚不宣布任何新权威，故先于回滚标记发出也安全）。
+      if (this.state.session !== s) return; // 已被更新的操作取代
+      const rb = rollbackAfterConfirmFailure(this.state.session);
+      const abort = rb.abort;
+      this.post(abort);
+      if (pendingAction) this.rememberUnsynced(s.sessionId, pendingAction, 'ack');
+      // 回滚态落库，但保留本次存储失败横幅：权威前进确已失败，讲解员需要
+      // 明确的可重试入口（重试产生新 attempt，绝不复用这轮回执）。
+      const err = this.state.storageError;
+      void this.commitSession(rb.session, this.state.session, { kind: 'ack' }, (v) =>
+        saveSession(v!)
+      ).then((rbOk) => {
+        if (!rbOk) return;
+        if (err) this.state = { ...this.state, storageError: err };
+        this.emit();
+      });
+    });
+  }
+
+  /**
+   * 阶段失败（单侧准备失败或单侧显示失败）：先持久化失败/回滚态，再 ABORT。
+   * 若落库本身也失败，仍发 ABORT 把穹顶收敛回磁盘上的最后确认帧，并挂出
+   * 可重试存储错误（权威从未前进，回滚不构成新的权威宣布）。
+   */
+  private dualStageFailure(
+    base: SessionRecord,
+    failed: SessionRecord,
+    abort: AbortMessage,
+    ack: Ack,
+    stage: 'prepared' | 'shown'
+  ) {
+    const fingerprint = `${base.sessionId}:${ack.seq}:${ack.attempt}:${stage}:${ack.role}:${ack.ok}`;
+    if (this.dualFailuresSeen.has(fingerprint)) return;
+    this.dualFailuresSeen.add(fingerprint);
+    void this.commitSession(failed, base, { kind: 'dualRollback' }, (v) => saveSession(v!)).then(
+      () => {
+        // 无论落库成功与否都把穹顶收回最后确认帧；成功失败均有确定状态。
+        this.post(abort);
+        this.dualFailuresSeen.delete(fingerprint);
+      }
+    );
+  }
+
+  /** partial 阶段收到同轮重复 PREPARED：幂等重发 SHOW（修复 SHOW 丢失）。 */
+  private maybeResendShow(s: SessionRecord, ack: Ack) {
+    const p = s.pending;
+    if (!p?.dual || p.status !== 'partial') return;
+    if (
+      ack.sessionId !== s.sessionId ||
+      ack.seq !== p.seq ||
+      ack.attempt !== p.attempts ||
+      !p.dual.prepared.main ||
+      !p.dual.prepared.backup
+    ) {
+      return;
+    }
+    if (!ack.ok) return;
+    if (ack.page !== p.target.page || ack.blackout !== p.target.blackout) return;
+    const show: ShowMessage = {
+      kind: 'SHOW',
+      sessionId: s.sessionId,
+      seq: p.seq,
+      page: p.target.page,
+      blackout: p.target.blackout,
+      attempt: p.attempts
+    };
+    this.post(show);
+  }
+
+  /** 存储横幅“重试写入”：双屏回滚标记落库失败后，重试当前回滚态即可。 */
+  private async retryDualRollback(): Promise<void> {
+    const s = this.state.session;
+    if (!s?.pending) return;
+    const next: SessionRecord = { ...s, pending: { ...s.pending, status: 'unconfirmed' } };
+    await this.commitSession(next, s, { kind: 'dualRollback' }, (v) => saveSession(v!));
   }
 
   dispose() {

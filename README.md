@@ -6,6 +6,16 @@
 
 ## 核心保证
 
+- **正式讲解双屏确认（dual 模式）**：开始放映时可选“双屏确认模式”，同时打开
+  主投影与备用投影两扇观众窗。每条切换携带会话、序号与目标版本（attempt）：
+  两侧先分别**装载**并回报 `PREPARED`（画面不切换），控制台收到两侧匹配的准备
+  回执后才发 `SHOW`；只有两侧显示回执（`SHOWN`）均匹配**且权威状态本地持久化
+  成功**，才广播 `CONFIRMED`、更新权威画面。任一侧失败、超时或存储失败时命令
+  保持未确认，并 `ABORT` 让**已先行显示的一侧回到上一张已确认画面**；重试沿用
+  原序号但换新 attempt，**绝不借用旧回执**。窗口重载先同步最后确认状态；迟到、
+  重复、异会话消息不推进新命令。不承诺两屏像素物理同时变化，但界面准确区分
+  **准备中 / 部分显示 / 已确认**（控制台双屏面板 + 各屏阶段徽标）。
+  原**单屏流程（single）保持完全兼容**，为默认模式。
 - **刷新/重开不回跳旧星图**：观众窗启动时进入“恢复态”，主动向控制台请求
   最后已确认页 + 遮黑状态的**完整快照**；恢复完成前，旧命令、旧确认、其它
   会话的消息全部无效。画面只能来自快照或严格相邻序号的新命令。
@@ -82,17 +92,19 @@ docker compose up --build --abort-on-container-exit verify
 ```
 src/
   protocol/
-    types.ts      消息与状态类型（CMD/ACK/SNAPSHOT_REQ/SNAPSHOT_RES/SESSION_ENDED）
-    console.ts    控制台状态机（纯函数，Vitest 核验）
-    viewer.ts     观众窗状态机（纯函数，Vitest 核验）
+    types.ts       消息与状态类型（CMD/SHOW/ABORT/CONFIRMED/ACK/SNAPSHOT_REQ/...）
+    console.ts     控制台单屏状态机（纯函数，Vitest 核验）
+    dual-console.ts 控制台双屏确认状态机：prepare→show→confirmed、回滚、attempt 闸门
+    viewer.ts      观众窗单屏状态机（纯函数，Vitest 核验）
+    dual-viewer.ts 观众窗双屏确认状态机：装载/显示/回滚/固化、旧 attempt 丢弃
   bus.ts          BroadcastChannel 封装
   db.ts           IndexedDB：blobs / 草稿 / 冻结节目单 / 当前会话
   image.ts        Blob 解码探测与 cover 绘制
-  console/        ConsoleController：状态机 + 通道 + IDB + 超时定时器
-  viewer/         ViewerRuntime：快照恢复 + 按页取 Blob + Canvas 呈现
+  console/        ConsoleController：状态机 + 通道 + IDB + 超时定时器（single/dual）
+  viewer/         ViewerRuntime：快照恢复 + 按页取 Blob + Canvas 呈现（single/dual）
   pages/          ConsolePage / ViewerPage（React）
-tests/            Vitest 协议测试
-e2e/              Playwright 多窗口测试
+tests/            Vitest 协议/控制器测试（含双屏握手、回滚、存储失败编排）
+e2e/              Playwright 多窗口测试（dual-* 为双屏双窗口/消息顺序/存储/重载/隔离）
 ```
 
 协议细节见 [`docs/protocol.md`](docs/protocol.md)。

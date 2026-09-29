@@ -508,3 +508,138 @@ body,
     grid-template-columns: 1fr;
   }
 }
+
+/* ---- 双屏确认模式 ------------------------------------------------------- */
+
+.mode-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--border, #333);
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--muted, #9aa4b2);
+  cursor: pointer;
+  max-width: 560px;
+  text-align: left;
+}
+.mode-choice input {
+  margin-top: 3px;
+}
+
+.mark-partial {
+  color: #f0b429;
+}
+
+.status-preparing {
+  color: var(--warn);
+}
+.status-partial {
+  color: #f0b429;
+}
+
+.dual-panel {
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(240, 180, 41, 0.35);
+  border-radius: 10px;
+  background: rgba(240, 180, 41, 0.06);
+}
+.dual-phase {
+  font-size: 14px;
+  font-weight: 600;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+.dual-phase .mono {
+  font-weight: 400;
+  color: var(--muted, #9aa4b2);
+  font-size: 12px;
+}
+.dual-screens {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 10px;
+}
+.dual-screen {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--panel, #161b22);
+  border-left: 4px solid #555;
+  font-size: 13px;
+}
+.dual-screen-name {
+  font-weight: 700;
+}
+.dual-screen-stage {
+  color: var(--muted, #9aa4b2);
+}
+.dual-screen-id {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.35);
+}
+.screen-ok {
+  border-left-color: #46c46e;
+}
+.screen-preparing {
+  border-left-color: var(--warn);
+}
+.screen-prepared {
+  border-left-color: #7aa2ff;
+}
+.screen-partial {
+  border-left-color: #f0b429;
+}
+.screen-rollback {
+  border-left-color: var(--danger);
+}
+
+.dual-open-row {
+  display: inline-flex;
+  gap: 8px;
+  margin-left: 10px;
+}
+
+.dual-stage-badge {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  color: rgba(255, 255, 255, 0.85);
+  background: rgba(0, 0, 0, 0.45);
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+}
+.dual-stage-badge .mono {
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 11px;
+}
+.stage-idle {
+  background: rgba(46, 125, 80, 0.55);
+}
+.stage-preparing,
+.stage-prepared,
+.stage-showing {
+  background: rgba(170, 120, 20, 0.6);
+}
+.stage-displayed {
+  background: rgba(180, 130, 20, 0.7);
+}
+.stage-failed-prepare {
+  background: rgba(170, 40, 40, 0.7);
+}
+.hud-role {
+  font-weight: 700;
+}

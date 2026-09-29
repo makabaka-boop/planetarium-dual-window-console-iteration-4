@@ -61,6 +61,33 @@ export function ViewerPage() {
           )}
         </>
       )}
+      {status.phase === 'dual-live' && (
+        <>
+          <div className="viewer-hud viewer-hud-dual" data-testid="viewer-hud">
+            <span className="hud-role" data-testid="viewer-role">
+              {status.role === 'main' ? '主投影' : '备用投影'}
+            </span>
+            {status.blackout ? '遮黑' : `第 ${status.page + 1} / ${status.total} 页`}
+            <span className="hud-seq mono">权威 seq {status.confirmedSeq}</span>
+          </div>
+          <div className={`dual-stage-badge stage-${status.stage}`} data-testid="dual-stage-badge">
+            {status.stage === 'idle' && '已确认：与权威画面一致'}
+            {status.stage === 'preparing' && '准备中：装载下一画面（屏幕未切换）'}
+            {status.stage === 'prepared' && '准备完成：等待控制台统一切换'}
+            {status.stage === 'showing' && '切换中…'}
+            {status.stage === 'displayed' && '部分显示：本屏已切换，等待双屏确认'}
+            {status.stage === 'failed-prepare' && '装载失败：保持上一张已确认画面'}
+            {status.pendingSeq != null && (
+              <span className="mono">目标 seq {status.pendingSeq}</span>
+            )}
+          </div>
+          {status.imageError && (
+            <div className="viewer-error" data-testid="viewer-image-error">
+              该页图片呈现失败，已回到最后确认页
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }

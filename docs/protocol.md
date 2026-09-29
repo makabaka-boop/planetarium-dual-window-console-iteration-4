@@ -3,15 +3,58 @@
 所有消息经同源 `BroadcastChannel('dome-presenter-v1')` 传递。图片**不**
 经过消息通道：观众窗按冻结节目单中的 `blobId` 直接从 IndexedDB 读取。
 
+## 确认模式（mode）
+
+会话在开始放映时确定确认模式，随会话冻结、写入 `SNAPSHOT_RES.mode`：
+
+- `single`（默认，**原单屏流程完全兼容**）：`CMD → 观众窗直接呈现 → ACK`，
+  消息不含 `phase/stage/attempt/role` 字段，旧观众窗/旧记录行为不变；
+- `dual`（正式讲解，主投影 main + 备用投影 backup 两扇观众窗）：一次切换
+  必须走完下面的“两阶段双屏确认”，控制台才会推进权威画面。
+
+### dual：两阶段双屏确认
+
+```
+CMD(phase=prepare, attempt=N)          控制台 → 两屏：只装载，不切画面
+   ├─ ACK(stage=prepared, role=main)   主屏装载完成（画面未动）
+   └─ ACK(stage=prepared, role=backup) 备屏装载完成（画面未动）
+                 两侧准备回执“会话+序号+目标+attempt+角色”全部匹配
+SHOW(attempt=N)                        控制台 → 两屏：现在才真正切换画面
+   ├─ ACK(stage=shown, role=main)
+   └─ ACK(stage=shown, role=backup)
+                 两侧显示回执匹配
+        权威状态（lastConfirmed）先落库，事务 oncomplete 成功
+CONFIRMED(seq,page,blackout)           控制台 → 两屏：把当前显示固化为权威帧
+```
+
+- 三态界面：**准备中**（preparing，等待两侧 PREPARED）/ **部分显示**
+  （partial，SHOW 已下发、仅一侧 SHOWN）/ **已确认**（CONFIRMED 后）。
+  不承诺两屏像素物理同时变化，但每块屏幕所处阶段在控制台与各屏分别可见。
+- 任一侧在准备阶段失败：命令转 `failed`，广播 `ABORT`（此阶段两屏都未切换，
+  仅清理装载状态），权威不变。
+- 部分显示时任一侧显示失败、或单侧回执超时（preparing/partial 均受
+  `DEFAULT_ACK_TIMEOUT_MS` 约束）：命令保持 `unconfirmed`，控制台先持久化
+  回滚态再广播 `ABORT(attempt=N)`，**已先行显示的一侧必须回到上一张已确认
+  画面**。
+- 两侧 SHOWN 匹配但权威落库失败：绝不广播 CONFIRMED，改发 `ABORT`，命令
+  回 `unconfirmed`，磁盘权威保持在上一张已确认画面。
+- **重试不借用旧回执**：重试沿用原 `seq` 但 `attempt += 1`，两侧
+  PREPARED/SHOWN 进度清空；观众窗对旧 attempt 的 CMD/SHOW/ABORT 一律忽略，
+  对同序号新 attempt 的 prepare 先回权威帧再重新装载。控制台刷新恢复后，
+  未决命令的两侧回执（纯内存临时进度）同样清空、回到 `unconfirmed`。
+
 ## 消息
 
 | 消息 | 方向 | 关键字段 |
 | --- | --- | --- |
-| `CMD` | 控制台 → 观众窗 | `sessionId`, `seq`, `action`, `page`, `blackout` |
-| `ACK` (`ok:true`) | 观众窗 → 控制台 | `sessionId`, `seq`, 实际呈现的 `page`/`blackout` |
-| `ACK` (`ok:false`) | 观众窗 → 控制台 | `reason:'IMAGE_FAILED'`、本次尝试的 `target{page,blackout}`、回退后实际停留的 `page`/`blackout` |
-| `SNAPSHOT_REQ` | 观众窗 → 控制台 | `viewerId`（启动/刷新后立即发，并每秒轮询直到拿到运行中会话） |
-| `SNAPSHOT_RES` | 控制台 → 观众窗 | 定向 `viewerId`、`running`、`confirmed{seq,page,blackout}`、`pending` |
+| `CMD` | 控制台 → 观众窗 | `sessionId`, `seq`, `action`, `page`, `blackout`；dual 另含 `phase:'prepare'`, `attempt` |
+| `SHOW` | 控制台 → 观众窗（dual） | `sessionId`, `seq`, `page`, `blackout`, `attempt`：两侧准备齐备后才下发，观众窗据此真正切画面 |
+| `ABORT` | 控制台 → 观众窗（dual） | `sessionId`, `seq`, 目标 `page/blackout`, `attempt`：失败/超时/存储失败时让已显示侧回上一张已确认画面 |
+| `CONFIRMED` | 控制台 → 观众窗（dual） | `sessionId`, `seq`, `page`, `blackout`：两侧显示匹配且权威落库成功后广播，固化两侧画面 |
+| `ACK` (`ok:true`) | 观众窗 → 控制台 | `sessionId`, `seq`, 实际呈现的 `page`/`blackout`；dual 另含 `stage:'prepared'\|'shown'`, `attempt`, `role` |
+| `ACK` (`ok:false`) | 观众窗 → 控制台 | `reason:'IMAGE_FAILED'`、本次尝试的 `target{page,blackout}`、回退后实际停留的 `page`/`blackout`；dual 另含 `stage/attempt/role` |
+| `SNAPSHOT_REQ` | 观众窗 → 控制台 | `viewerId`、dual 下申报 `role`（启动/刷新后立即发，并每秒轮询直到拿到运行中会话） |
+| `SNAPSHOT_RES` | 控制台 → 观众窗 | 定向 `viewerId`、`running`、`confirmed{seq,page,blackout}`、`pending`、`mode`、dual 下的 `role` |
 | `SESSION_ENDED` | 控制台 → 观众窗 | `sessionId` |
 
 ## 权威状态

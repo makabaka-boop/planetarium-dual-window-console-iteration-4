@@ -4,6 +4,7 @@
 import {
   CommandAction,
   CommandMessage,
+  ConfirmMode,
   ConfirmedFrame,
   DEFAULT_ACK_TIMEOUT_MS,
   PendingCommand,
@@ -19,8 +20,12 @@ export interface StartResult {
 export function startSession(
   sessionId: string,
   pageCount: number,
-  startedAt = Date.now()
+  startedAt: number | ConfirmMode = Date.now(),
+  mode: ConfirmMode = 'single'
 ): SessionRecord {
+  // 兼容旧签名 startSession(id, pages, startedAt?)；第三参为模式字符串时从第四参取模式。
+  const at = typeof startedAt === 'number' ? startedAt : Date.now();
+  const confirmMode = typeof startedAt === 'number' ? mode : startedAt;
   if (pageCount <= 0) throw new Error('节目单为空，无法开始放映');
   // 骨架占位：真实 SlideItem 由调用方（ConsoleController）在落库时替换。
   const items = Array.from({ length: pageCount }, (_, i) => ({
@@ -32,11 +37,12 @@ export function startSession(
   }));
   return {
     sessionId,
-    startedAt,
+    startedAt: at,
     running: true,
     frozenProgram: { items },
     lastConfirmed: initialConfirmed(pageCount),
-    pending: null
+    pending: null,
+    mode: confirmMode
   };
 }
 

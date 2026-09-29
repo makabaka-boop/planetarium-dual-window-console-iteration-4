@@ -16,7 +16,12 @@ import { MessageBus } from '../bus';
 import { StorageError, getBlob, loadFrozen } from '../db';
 import { decodeBlob, drawCover } from '../image';
 import {
+  AbortMessage,
   CommandMessage,
+  ConfirmMode,
+  ConfirmedMessage,
+  ScreenRole,
+  ShowMessage,
   SnapshotResponse,
   WireMessage
 } from '../protocol/types';
@@ -30,6 +35,21 @@ import {
   receiveWire,
   resolveRender
 } from '../protocol/viewer';
+import {
+  AbortResult,
+  DualViewerState,
+  applyDualSnapshot,
+  beginDualRecovery,
+  endDual,
+  initDualViewer,
+  receiveAbort,
+  receiveConfirmed,
+  receivePrepareCommand,
+  receiveShow,
+  replayShown,
+  resolvePrepare,
+  resolveShow
+} from '../protocol/dual-viewer';
 
 function makeViewerId(): string {
   const rand =
@@ -39,15 +59,61 @@ function makeViewerId(): string {
   return `viewer_${rand}`;
 }
 
+/** 从 URL ?role=main|backup 读取双屏角色；缺省为主屏（单屏路径不使用该值）。 */
+function roleFromUrl(): ScreenRole {
+  try {
+    const r = new URL(window.location.href).searchParams.get('role');
+    if (r === 'backup') return 'backup';
+  } catch {
+    /* ignore */
+  }
+  return 'main';
+}
+
+export type DualStageView =
+  | 'idle'
+  | 'preparing'
+  | 'prepared'
+  | 'showing'
+  | 'displayed'
+  | 'failed-prepare';
+
 export type PresentStatus =
   | { phase: 'standby' }
   | { phase: 'recovering' }
-  | { phase: 'live'; page: number; total: number; blackout: boolean; seq: number; imageError: boolean }
-  | { phase: 'ended' };
+  | {
+      phase: 'live';
+      page: number;
+      total: number;
+      blackout: boolean;
+      seq: number;
+      imageError: boolean;
+    }
+  | { phase: 'ended' }
+  | {
+      phase: 'dual-live';
+      role: ScreenRole;
+      /** 穹顶当前实际显示的页/遮黑（可能是未确认的目标画面）。 */
+      page: number;
+      blackout: boolean;
+      total: number;
+      /** 权威（已确认）页与序号。 */
+      confirmedPage: number;
+      confirmedSeq: number;
+      confirmedBlackout: boolean;
+      /** 本次切换所处阶段；UI 据此区分 准备中/部分显示/已确认。 */
+      stage: DualStageView;
+      pendingSeq: number | null;
+      imageError: boolean;
+    };
 
 export class ViewerRuntime {
   private bus: MessageBus;
   private state: ViewerState;
+  /** 双屏确认模式下的协议状态；mode==='dual' 快照恢复后非空，与 state 二选一。 */
+  private dual: DualViewerState | null = null;
+  private mode: ConfirmMode = 'single';
+  private readonly role: ScreenRole;
   private ctx: CanvasRenderingContext2D;
   private cache = new Map<number, HTMLImageElement>();
   private blobIdByPage: string[] = [];
@@ -69,6 +135,7 @@ export class ViewerRuntime {
     if (!ctx) throw new Error('2d context unavailable');
     this.ctx = ctx;
     this.bus = bus ?? new MessageBus();
+    this.role = roleFromUrl();
     this.state = initViewer(makeViewerId());
   }
 
@@ -82,6 +149,31 @@ export class ViewerRuntime {
   }
 
   getStatus(): PresentStatus {
+    if (this.mode === 'dual' && this.dual) {
+      const d = this.dual;
+      switch (d.phase) {
+        case 'standby':
+          return { phase: 'standby' };
+        case 'recovering':
+          return { phase: 'recovering' };
+        case 'ended':
+          return { phase: 'ended' };
+        case 'live':
+          return {
+            phase: 'dual-live',
+            role: d.role,
+            page: d.display?.page ?? 0,
+            blackout: d.display?.blackout ?? false,
+            total: this.total,
+            confirmedPage: d.frame?.page ?? 0,
+            confirmedSeq: d.frame?.seq ?? 0,
+            confirmedBlackout: d.frame?.blackout ?? false,
+            stage: d.stage === 'idle' ? 'idle' : d.stage,
+            pendingSeq: d.pending?.target.seq ?? null,
+            imageError: this.imageError
+          };
+      }
+    }
     switch (this.state.phase) {
       case 'standby':
         return { phase: 'standby' };
@@ -106,19 +198,26 @@ export class ViewerRuntime {
     if (this.bus.closed) this.bus = new MessageBus();
     this.unsubscribe = this.bus.subscribe((m) => this.onMessage(m));
     this.state = beginRecovery(this.state);
+    this.dual = beginDualRecovery(initDualViewer(this.state.viewerId, this.role));
     // 恢复即新代次：上一代残留的异步绘制（若有）一律作废。
     this.epoch++;
     this.emit();
     this.requestSnapshot();
     // 重开后主动取得快照；控制台缺席时持续轮询，直到拿到运行中会话的快照。
     this.poll = setInterval(() => {
-      if (this.state.phase === 'recovering' || this.state.phase === 'standby') {
+      if (this.isAwaitingSnapshot()) {
         this.requestSnapshot();
       }
     }, 1000);
     // 缩放只重绘“当前有效帧”；重绘本身携带代次，过期窗口/停映后的迟到重绘无效。
     this.resizeHandler = () => this.repaintCurrent(this.epoch);
     window.addEventListener('resize', this.resizeHandler);
+  }
+
+  private isAwaitingSnapshot(): boolean {
+    return this.mode === 'dual'
+      ? this.dual?.phase === 'recovering' || this.dual?.phase === 'standby'
+      : this.state.phase === 'recovering' || this.state.phase === 'standby';
   }
 
   dispose() {
@@ -129,10 +228,19 @@ export class ViewerRuntime {
   }
 
   private requestSnapshot() {
-    this.bus.post({ kind: 'SNAPSHOT_REQ', viewerId: this.state.viewerId });
+    this.bus.post({
+      kind: 'SNAPSHOT_REQ',
+      viewerId: this.state.viewerId,
+      role: this.role
+    });
   }
 
   private onMessage(msg: WireMessage) {
+    // 双屏路径与单屏路径在快照恢复确定 mode 后完全分流。
+    if (this.mode === 'dual') {
+      this.onDualMessage(msg);
+      return;
+    }
     switch (msg.kind) {
       case 'SNAPSHOT_RES':
         void this.handleSnapshot(msg);
@@ -159,10 +267,53 @@ export class ViewerRuntime {
     }
   }
 
+  private onDualMessage(msg: WireMessage) {
+    const d = this.dual;
+    if (!d) return;
+    switch (msg.kind) {
+      case 'SNAPSHOT_RES':
+        void this.handleDualSnapshot(msg);
+        break;
+      case 'CMD':
+        if (msg.phase === 'prepare') void this.handlePrepare(msg);
+        break;
+      case 'SHOW':
+        void this.handleShow(msg);
+        break;
+      case 'ABORT':
+        this.handleAbort(msg);
+        break;
+      case 'CONFIRMED':
+        this.handleConfirmed(msg);
+        break;
+      case 'SESSION_ENDED': {
+        const prev = d.phase;
+        this.dual = endDual(d, msg.sessionId);
+        if (prev !== this.dual.phase) {
+          this.epoch++;
+          this.cache.clear();
+          this.blobIdByPage = [];
+          this.imageError = false;
+          this.paintBlack();
+          this.emit();
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
   private async handleSnapshot(res: SnapshotResponse) {
     if (res.viewerId !== this.state.viewerId) return;
     if (this.state.phase !== 'recovering') return;
     if (!res.running) return; // 保持待命，继续轮询
+
+    // 双屏确认模式的会话：切到 dual 协议路径恢复（状态互不混淆）。
+    if (res.mode === 'dual') {
+      await this.handleDualSnapshot(res);
+      return;
+    }
 
     // 节目单顺序在冻结时已随会话写入 IndexedDB；消息通道只传权威画面。
     const program =
@@ -177,6 +328,7 @@ export class ViewerRuntime {
     // start()/beginRecovery 已为本代次预留了 epoch；快照沿用它，之后的命令才 +1。
     const gen = this.epoch;
     if (this.state.phase !== 'recovering') return;
+    this.mode = 'single';
     this.total = ids.length;
     this.blobIdByPage = ids;
     this.state = applySnapshot(this.state, res);
@@ -186,6 +338,32 @@ export class ViewerRuntime {
     // 用于确定性地复现“恢复刚完成、图片仍在解码时连续切页/遮黑/停映”。
     await this.testGate('snapshotLive');
     await this.paintConfirmed(gen);
+    this.emit();
+  }
+
+  /** 双屏模式快照恢复：窗口（重）载后先同步最后确认状态，画面直接画权威帧。 */
+  private async handleDualSnapshot(res: SnapshotResponse) {
+    const d0 = this.dual;
+    if (!d0 || res.viewerId !== d0.viewerId) return;
+    if (d0.phase !== 'recovering') return;
+    if (!res.running) return;
+
+    const program =
+      (await loadFrozen(res.sessionId).catch(() => null)) ??
+      (await loadFrozen('latest').catch(() => null));
+    const ids = program?.items.map((i) => i.blobId) ?? [];
+    if (ids.length === 0) return;
+
+    const gen = this.epoch;
+    if (!this.dual || this.dual.phase !== 'recovering') return;
+    this.mode = 'dual';
+    this.total = ids.length;
+    this.blobIdByPage = ids;
+    this.dual = applyDualSnapshot(this.dual, res);
+    this.epoch = gen;
+    this.imageError = false;
+    await this.testGate('snapshotLive');
+    await this.paintDualConfirmed(gen);
     this.emit();
   }
 
@@ -279,6 +457,154 @@ export class ViewerRuntime {
     return true;
   }
 
+  // ---- 双屏确认模式：prepare / show / abort / confirmed -------------------
+
+  private dualStill(gen: number): boolean {
+    return gen === this.epoch && this.mode === 'dual' && this.dual?.phase === 'live';
+  }
+
+  /** 装载阶段：只预解码目标资源（黑屏/遮黑无需取图），绝不切换画面。 */
+  private async handlePrepare(msg: CommandMessage) {
+    const d0 = this.dual;
+    if (!d0 || d0.phase !== 'live') return;
+    const accept = receivePrepareCommand(d0, msg);
+    this.dual = accept.state;
+    const target = accept.preload;
+    if (!target) return;
+    // 已进入装载阶段：立即让界面反映“准备中”（屏幕画面此刻仍停在权威帧）。
+    this.emit();
+    const attempt = msg.attempt!;
+    const gen = ++this.epoch;
+    await this.testGate('beforePresent');
+    if (!this.dualStill(gen)) return;
+    if (!this.dual.pending || this.dual.pending.attempt !== attempt) return;
+    try {
+      if (!target.blackout) {
+        // 预装载：解码后进入缓存即完成，画面保持权威帧不动。
+        await this.loadImage(target.page);
+      }
+      if (!this.dualStill(gen)) return;
+      const resolved = resolvePrepare(this.dual, target, attempt, true);
+      if (!resolved) return;
+      this.dual = resolved.state;
+      this.imageError = false;
+      this.bus.post(resolved.ack);
+      this.emit();
+    } catch (err) {
+      console.error('dual prepare failed', err);
+      if (!this.dualStill(gen)) return;
+      await this.testGate('afterError');
+      if (!this.dualStill(gen)) return;
+      const resolved = resolvePrepare(this.dual, target, attempt, false);
+      if (!resolved) return;
+      this.dual = resolved.state;
+      this.imageError = true;
+      this.bus.post(resolved.ack);
+      this.emit();
+    }
+  }
+
+  /** 显示阶段：两侧准备齐备后控制台才下发；真正切换穹顶画面。 */
+  private async handleShow(msg: ShowMessage) {
+    const d0 = this.dual;
+    if (!d0 || d0.phase !== 'live') return;
+    const accept = receiveShow(d0, msg);
+    // 已显示状态收到重复 SHOW：画面不动，重放 SHOWN（幂等收敛）。
+    if (accept.render === null && accept.state.stage === 'displayed') {
+      const replay = replayShown(accept.state);
+      if (replay) this.bus.post(replay);
+      return;
+    }
+    this.dual = accept.state;
+    const target = accept.render;
+    if (!target) return;
+    this.emit(); // 界面进入“切换中”
+    const attempt = msg.attempt;
+    const gen = ++this.epoch;
+    await this.testGate('beforePresent');
+    if (!this.dualStill(gen)) return;
+    try {
+      if (target.blackout) {
+        this.paintBlack();
+      } else {
+        const img = await this.loadImage(target.page);
+        if (!this.dualStill(gen)) return;
+        this.drawImage(img);
+      }
+      if (!this.dualStill(gen)) return;
+      const resolved = resolveShow(this.dual, target, attempt, true);
+      if (!resolved) return;
+      this.dual = resolved.state;
+      this.imageError = false;
+      this.bus.post(resolved.ack);
+      this.emit();
+    } catch (err) {
+      console.error('dual show failed', err);
+      if (!this.dualStill(gen)) return;
+      await this.testGate('afterError');
+      if (!this.dualStill(gen)) return;
+      // 显示失败：状态机已把画面回退到最后确认帧，这里补绘回退帧。
+      const resolved = resolveShow(this.dual, target, attempt, false);
+      if (!resolved) return;
+      this.dual = resolved.state;
+      await this.repaintDualConfirmed(gen);
+      this.imageError = true;
+      this.bus.post(resolved.ack);
+      this.emit();
+    }
+  }
+
+  /** 回滚：已先行显示的一侧必须回到上一张已确认画面。 */
+  private handleAbort(msg: AbortMessage) {
+    const d0 = this.dual;
+    if (!d0 || d0.phase !== 'live') return;
+    const result: AbortResult = receiveAbort(d0, msg);
+    if (result.state === d0) return;
+    this.dual = result.state;
+    if (result.repaintConfirmed) {
+      // 回滚切换画面来源：旧代次的迟到绘制作废，用新代次重绘权威帧。
+      const gen = ++this.epoch;
+      void this.repaintDualConfirmed(gen);
+    }
+    this.imageError = false;
+    this.emit();
+  }
+
+  /** 权威固化：两侧显示匹配且控制台持久化成功后到达。 */
+  private handleConfirmed(msg: ConfirmedMessage) {
+    const d0 = this.dual;
+    if (!d0 || d0.phase !== 'live') return;
+    const next = receiveConfirmed(d0, msg);
+    if (next === d0) return;
+    this.dual = next;
+    this.imageError = false;
+    this.emit();
+  }
+
+  /** 双屏恢复/回滚后绘制权威帧（上一张已确认画面）；受代次保护。 */
+  private async paintDualConfirmed(gen: number) {
+    await this.repaintDualConfirmed(gen);
+  }
+
+  private async repaintDualConfirmed(gen: number) {
+    const d = this.dual;
+    if (!this.dualStill(gen) || !d || !d.frame) return;
+    const frame = d.frame;
+    if (frame.blackout) {
+      this.paintBlack();
+      return;
+    }
+    try {
+      const img = await this.loadImage(frame.page);
+      if (!this.dualStill(gen) || !this.dual?.frame) return;
+      if (this.dual.frame !== frame) return;
+      this.drawImage(img);
+    } catch {
+      if (!this.dualStill(gen)) return;
+      this.paintBlack();
+    }
+  }
+
   private async loadImage(page: number): Promise<HTMLImageElement> {
     const cached = this.cache.get(page);
     if (cached) return cached;
@@ -328,6 +654,25 @@ export class ViewerRuntime {
 
   /** 缩放触发：只重绘当前有效帧；捕获调用时代次，过期窗口的迟到重绘丢弃。 */
   private async repaintCurrent(gen: number) {
+    if (this.mode === 'dual') {
+      const d = this.dual;
+      if (gen !== this.epoch || !d || d.phase !== 'live' || !d.display) return;
+      const frame = d.display;
+      if (frame.blackout) {
+        this.paintBlack();
+        return;
+      }
+      try {
+        const img = await this.loadImage(frame.page);
+        if (gen !== this.epoch || this.dual?.phase !== 'live') return;
+        if (this.dual.display !== frame) return;
+        this.drawImage(img);
+      } catch {
+        if (gen !== this.epoch || this.dual?.phase !== 'live') return;
+        this.paintBlack();
+      }
+      return;
+    }
     if (gen !== this.epoch || this.state.phase !== 'live' || !this.state.frame) return;
     const frame = this.state.frame;
     if (frame.blackout) {
